@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (for example, v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +27,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -34,11 +42,13 @@ jobs:
 
       - name: Verify tag and package version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           EXPECTED_TAG="v${PACKAGE_VERSION}"
-          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package version ${PACKAGE_VERSION}."
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match package version ${PACKAGE_VERSION}."
             echo "Expected tag: ${EXPECTED_TAG}"
             exit 1
           fi
