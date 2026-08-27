@@ -1,6 +1,6 @@
 {
 	"name": "pi-auto-wait",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi extension that reports provider usage and can wait for exhausted Codex 5-hour limits to reset.",
 	"type": "module",
 	"license": "GPL-3.0-only",
