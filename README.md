@@ -143,7 +143,8 @@ Close
 
 - 仅适用于官方 `openai-codex` provider 返回的 5h window，不处理周限额、credits 或其他 provider。
 - provider 没有返回 `reset_at`，或用量查询失败时，扩展会提示原因并**放行请求**，不会猜测等待时长。
-- 如果一条已经发出的请求恰好触发 429，扩展无法追溯重试那条请求；它会保护之后提交的 prompt，在下一次 agent run 前先检查并等待。
+- 如果一条已经发出的请求恰好触发 Codex 的 usage-limit 429，扩展会在 `agent_end` 识别该错误，保留本次 prompt，等待 5h 窗口重置后自动重发并继续；同一耗尽周期内最多自动重试 3 次，超过后提示你手动重新提交。
+- 自动重发会作为一条新的 user message 进入会话，失败的那条 assistant 错误消息仍留在上下文里；如果用量端点报告的余量与真实限额有滞后，可能仍会再触发一次 429（受上面 3 次上限保护）。
 - 等待状态与 reset 时间只保留在进程内存中，不写入磁盘。
 
 <a id="zh-fast"></a>
@@ -334,7 +335,7 @@ Automatic wait is off by default. When `codexAutoWait5h` is enabled, Pi performs
 
 A model change, reload, session replacement, or shutdown cancels the wait. Missing reset times and usage-query failures fail open: Pi reports the condition and continues rather than inventing a wait duration.
 
-Automatic wait cannot retrospectively retry a provider request that has already returned 429. It protects later submitted prompts by checking before the agent run begins.
+If a run trips a Codex usage-limit 429 mid-flight, the extension detects it at `agent_end`, keeps the submitted prompt, waits for the 5h window to reset, and automatically resends it to continue. Consecutive auto-resumes are capped at 3 attempts per exhaustion episode; after that it asks you to resubmit manually. The resend arrives as a fresh user message, so the failed assistant error message stays in context. If the usage endpoint's reported balance lags behind the real limit, another 429 is possible and is bounded by the cap.
 
 ## Provider semantics
 

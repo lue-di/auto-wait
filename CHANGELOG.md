@@ -3,6 +3,10 @@
 本项目独立发布的 Pi 扩展，基于上游 `@narumitw/pi-usage`（v0.52.3）的用法/配额功能集开发。
 历史版本记录见上游仓库 `narumiruna/pi-extensions`。
 
+## Unreleased
+
+- Codex 5h 自动等待增强：在一次 run 中途触发 Codex usage-limit 429 时，扩展在 `agent_end` 识别该错误，保留已提交的 prompt，等 5h 窗口重置后自动重发并继续（同一耗尽周期内最多 3 次）。
+
 ## 0.1.0
 
 - 首个独立发布版本，包名 `pi-auto-wait`。

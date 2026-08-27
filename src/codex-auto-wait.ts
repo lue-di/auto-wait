@@ -1,4 +1,6 @@
 import type {
+	AgentEndEvent,
+	BeforeAgentStartEvent,
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -9,6 +11,18 @@ import { isAbortError, modelIdentity } from "./usage-helpers.js";
 
 const RESET_SETTLE_MS = 2_000;
 const STALE_RESET_RECHECK_MS = 15_000;
+const MAX_AUTO_RESUME_ATTEMPTS = 3;
+// Matches Codex subscription/account exhaustion (the 5h primary window and
+// weekly/monthly limits), not transient "rate limit" throttles.
+const USAGE_LIMIT_ERROR_PATTERN =
+	/GoUsageLimitError|FreeUsageLimitError|usage limit|available balance|insufficient[_ -]?quota|out of budget|quota exceeded|billing/i;
+
+type ResendContent =
+	| string
+	| Array<
+			| { type: "text"; text: string }
+			| NonNullable<BeforeAgentStartEvent["images"]>[number]
+	  >;
 
 type CurrentCodexUsage = {
 	model: PiModel;
@@ -35,10 +49,45 @@ export function registerCodexAutoWait(
 ) {
 	let sessionController = new AbortController();
 	let waiting: WaitingState | undefined;
+	// The prompt currently being run; kept so an exhausted-Codex failure can be
+	// auto-resumed after the 5h window resets.
+	let pendingPrompt:
+		| { text: string; images?: BeforeAgentStartEvent["images"] }
+		| undefined;
+	let resumeController = new AbortController();
+	let resuming = false;
+	let resumeAttempts = 0;
+	// True when the next before_agent_start comes from our own auto-resubmission,
+	// so the resume-attempt cap survives across consecutive auto-resumes.
+	let autoResubmitPending = false;
 
 	const enabled = () => settingsRuntime.get().settings.codexAutoWait5h;
 	const clearWaiting = () => {
 		waiting = undefined;
+	};
+	const abortResumeWait = () => {
+		resumeController.abort();
+		resumeController = new AbortController();
+		resuming = false;
+	};
+	const resetAutoResume = () => {
+		abortResumeWait();
+		pendingPrompt = undefined;
+		resumeAttempts = 0;
+		autoResubmitPending = false;
+	};
+	const usageLimitErrorMessage = (event: AgentEndEvent): string | undefined => {
+		for (let i = event.messages.length - 1; i >= 0; i -= 1) {
+			const message = event.messages[i];
+			if (message.role !== "assistant") continue;
+			// A Codex usage-limit error is terminal, so only the final assistant
+			// message can decide the outcome.
+			if (!message.errorMessage) return undefined;
+			return USAGE_LIMIT_ERROR_PATTERN.test(message.errorMessage)
+				? message.errorMessage
+				: undefined;
+		}
+		return undefined;
 	};
 
 	const observe = (report: UsageReport, model: PiModel | undefined) => {
@@ -60,21 +109,21 @@ export function registerCodexAutoWait(
 		waiting = { modelIdentity: modelIdentity(model) ?? "", resetsAtMs };
 	};
 
-	const waitForAvailability = async (ctx: ExtensionContext) => {
+	const waitForAvailability = async (
+		ctx: ExtensionContext,
+		signal: AbortSignal = sessionController.signal,
+	) => {
 		if (!enabled() || ctx.model?.provider !== "openai-codex") return;
 		const expectedModel = modelIdentity(ctx.model);
 		let announced = false;
 		while (
-			!sessionController.signal.aborted &&
+			!signal.aborted &&
 			enabled() &&
 			modelIdentity(ctx.model) === expectedModel
 		) {
 			let current: CurrentCodexUsage | undefined;
 			try {
-				current = await dependencies.checkCurrentUsage(
-					ctx,
-					sessionController.signal,
-				);
+				current = await dependencies.checkCurrentUsage(ctx, signal);
 			} catch (error) {
 				if (isAbortError(error)) return;
 				if (ctx.hasUI) {
@@ -121,7 +170,7 @@ export function registerCodexAutoWait(
 					? resetsAtMs - Date.now() + RESET_SETTLE_MS
 					: STALE_RESET_RECHECK_MS;
 			try {
-				await waitFor(delay, sessionController.signal);
+				await waitFor(delay, signal);
 			} catch (error) {
 				if (!isAbortError(error)) throw error;
 				return;
@@ -161,6 +210,7 @@ export function registerCodexAutoWait(
 			sessionController.abort();
 			sessionController = new AbortController();
 			clearWaiting();
+			resetAutoResume();
 		}
 		if (ctx.hasUI) {
 			ctx.ui.notify(
@@ -193,22 +243,96 @@ export function registerCodexAutoWait(
 		},
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
+		abortResumeWait();
+		if (!autoResubmitPending) resumeAttempts = 0;
+		autoResubmitPending = false;
+		if (enabled() && ctx.model?.provider === "openai-codex") {
+			pendingPrompt = { text: event.prompt, images: event.images };
+		} else {
+			pendingPrompt = undefined;
+		}
 		await waitForAvailability(ctx);
+	});
+	pi.on("agent_end", async (event, ctx) => {
+		if (!enabled() || ctx.model?.provider !== "openai-codex") return;
+		if (usageLimitErrorMessage(event)) {
+			if (resuming || !pendingPrompt) return;
+			if (resumeAttempts >= MAX_AUTO_RESUME_ATTEMPTS) {
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						`Codex usage limit kept blocking auto-resume; stopped after ${resumeAttempts} attempt(s). Resubmit the prompt once the limit resets.`,
+						"warning",
+					);
+				}
+				pendingPrompt = undefined;
+				return;
+			}
+			resuming = true;
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					"Codex usage limit hit; waiting for the 5h window to reset, then resuming your prompt.",
+					"info",
+				);
+			}
+			const prompt = pendingPrompt;
+			const controller = resumeController;
+			try {
+				await waitForAvailability(ctx, controller.signal);
+			} catch (error) {
+				if (!isAbortError(error)) throw error;
+				if (resumeController === controller) {
+					abortResumeWait();
+					pendingPrompt = undefined;
+				}
+				return;
+			}
+			if (controller.signal.aborted) {
+				if (resumeController === controller) {
+					abortResumeWait();
+					pendingPrompt = undefined;
+				}
+				return;
+			}
+			resumeAttempts += 1;
+			autoResubmitPending = true;
+			resuming = false;
+			pendingPrompt = undefined;
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					"Codex usage is available; resuming your previous prompt.",
+					"info",
+				);
+			}
+			const content: ResendContent =
+				prompt.images && prompt.images.length > 0
+					? [{ type: "text", text: prompt.text }, ...prompt.images]
+					: prompt.text;
+			pi.sendUserMessage(content, { deliverAs: "followUp" });
+			return;
+		}
+		// The run finished without tripping the Codex usage limit (success, abort,
+		// or a non-usage error). Drop any pending auto-resume state.
+		pendingPrompt = undefined;
+		resumeAttempts = 0;
+		autoResubmitPending = false;
 	});
 	pi.on("session_start", () => {
 		sessionController.abort();
 		sessionController = new AbortController();
 		clearWaiting();
+		resetAutoResume();
 	});
 	pi.on("model_select", () => {
 		sessionController.abort();
 		sessionController = new AbortController();
 		clearWaiting();
+		resetAutoResume();
 	});
 	pi.on("session_shutdown", () => {
 		sessionController.abort();
 		clearWaiting();
+		resetAutoResume();
 	});
 
 	return {
