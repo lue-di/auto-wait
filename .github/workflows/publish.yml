@@ -31,10 +31,11 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Node.js
+        # Trusted Publishing (OIDC) is used for npm auth, so no registry-url /
+        # NODE_AUTH_TOKEN here: registry-url would interfere with the OIDC flow.
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           cache: npm
 
       - name: Install dependencies
@@ -71,4 +72,7 @@ jobs:
 
       - name: Publish to npm
         if: steps.package.outputs.already_published != 'true'
+        # Requires the package's Trusted Publisher to be configured on npmjs.com
+        # for this repo (lue-di/auto-wait, workflow publish.yml) so the OIDC
+        # identity token from GitHub Actions can authorize the publish.
         run: npm publish --access public --provenance
